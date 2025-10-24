@@ -1,113 +1,75 @@
-// server.js — Bihar FM Central Relay Server
 const express = require("express");
 const http = require("http");
+const fs = require("fs");
+const path = require("path");
 const { WebSocketServer } = require("ws");
-const crypto = require("crypto");
 
 const app = express();
-
-// Root route check
-app.get("/", (req, res) => {
-  res.send("🎧 Bihar FM Central Relay Server is Live!");
-});
-
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// State
-let broadcaster = null; // Only one broadcaster allowed
-const listeners = new Map(); // id -> ws
+let broadcasterFilePath = null; // currently streamed file
+let broadcasterWs = null;
 
-// Safe send helper
-function safeSend(ws, data) {
-  if (ws.readyState === ws.OPEN) {
-    try { ws.send(JSON.stringify(data)); } 
-    catch (e) { console.error("Send error:", e.message); }
-  }
-}
+// Root
+app.get("/", (req, res) => res.send("🎧 Bihar FM Live Server"));
 
-// Keep-alive ping
-setInterval(() => {
-  if (broadcaster && broadcaster.readyState === broadcaster.OPEN) {
-    safeSend(broadcaster, { type: "ping" });
-  }
-  for (const ws of listeners.values()) {
-    if (ws.readyState === ws.OPEN) safeSend(ws, { type: "ping" });
-  }
-}, 25000);
-
-// WebSocket handling
-wss.on("connection", (ws, req) => {
-  const origin = req.headers.origin || "";
-  if (!origin.includes("yourdomain.com")) { // replace with your domain
-    ws.close(1008, "Unauthorized domain");
+// Serve audio file as mp3 URL
+app.get("/stream", (req, res) => {
+  if(!broadcasterFilePath || !fs.existsSync(broadcasterFilePath)){
+    res.status(404).send("No stream available");
     return;
   }
+  const stat = fs.statSync(broadcasterFilePath);
+  const total = stat.size;
 
-  const id = crypto.randomUUID();
-  console.log("🔗 New connection:", id);
+  let range = req.headers.range;
+  if (!range) range = "bytes=0-";
 
-  ws.on("message", (raw) => {
-    let msg;
-    try { msg = JSON.parse(raw.toString()); } catch { return; }
-    const { type, role, payload } = msg;
+  const parts = range.replace(/bytes=/, "").split("-");
+  const start = parseInt(parts[0], 10);
+  const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
 
-    if (type === "register") {
-      if (role === "broadcaster") {
-        if (broadcaster) { 
-          safeSend(ws, { type: "error", message: "Broadcaster already connected" });
-          ws.close();
-          return;
-        }
-        broadcaster = ws;
-        console.log(`🧩 Broadcaster registered: ${id}`);
-      } else if (role === "listener") {
-        listeners.set(id, ws);
-        console.log(`🧩 Listener registered: ${id}`);
-        if (broadcaster) safeSend(broadcaster, { type: "listener-joined", id });
-      }
-      return;
-    }
+  const chunkSize = (end - start) + 1;
+  const stream = fs.createReadStream(broadcasterFilePath, { start, end });
 
-    // Relay metadata
-    if (type === "metadata" && ws === broadcaster) {
-      for (const listener of listeners.values()) {
-        safeSend(listener, {
-          type: "metadata",
-          title: payload.title,
-          artist: payload.artist,
-          cover: payload.cover
-        });
-      }
-      return;
-    }
-
-    // Relay audio chunks
-    if (type === "audio" && ws === broadcaster) {
-      for (const listener of listeners.values()) {
-        safeSend(listener, { type: "audio", payload });
-      }
-      return;
-    }
+  res.writeHead(206, {
+    "Content-Range": `bytes ${start}-${end}/${total}`,
+    "Accept-Ranges": "bytes",
+    "Content-Length": chunkSize,
+    "Content-Type": "audio/mpeg"
   });
-
-  ws.on("close", () => {
-    if (ws === broadcaster) {
-      console.log("❌ Broadcaster disconnected");
-      broadcaster = null;
-      for (const listener of listeners.values()) {
-        safeSend(listener, { type: "broadcaster-left" });
-      }
-    } else if (listeners.has(id)) {
-      listeners.delete(id);
-      console.log(`❌ Listener disconnected: ${id}`);
-    }
-  });
-
-  ws.on("error", (err) => console.error("WebSocket error:", err.message));
+  stream.pipe(res);
 });
 
-server.keepAliveTimeout = 70000;
-server.headersTimeout = 75000;
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`✅ Bihar FM Server running on port ${PORT}`));
+// WebSocket for broadcaster panel
+wss.on("connection", ws => {
+  ws.on("message", msg => {
+    try{
+      const data = JSON.parse(msg);
+      if(data.type==="register" && data.role==="broadcaster"){
+        broadcasterWs = ws;
+        console.log("Broadcaster connected");
+      }
+
+      // Receive file path from broadcaster
+      if(data.type==="file"){
+        // Server stores file path to serve to listeners
+        broadcasterFilePath = data.payload.path;
+        console.log("Broadcaster streaming file:", broadcasterFilePath);
+      }
+    }catch(e){}
+  });
+
+  ws.on("close", ()=> {
+    if(ws===broadcasterWs) {
+      broadcasterWs=null;
+      broadcasterFilePath=null;
+      console.log("Broadcaster disconnected, stream stopped");
+    }
+  });
+});
+
+// Start server
+const PORT = 3000;
+server.listen(PORT, ()=>console.log(`✅ Bihar FM Server running on port ${PORT}`));
