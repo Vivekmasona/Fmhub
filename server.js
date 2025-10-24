@@ -24,16 +24,16 @@ app.get("/stream", (req, res) => {
 // WebSocket for broadcaster
 let broadcasterWs = null;
 wss.on("connection", ws => {
+  ws.binaryType = "arraybuffer"; // direct ArrayBuffer
   ws.on("message", msg => {
     if (ws === broadcasterWs) {
-      // raw PCM Float32Array from broadcaster
-      ffmpeg.stdin.write(Buffer.from(msg));
+      ffmpeg.stdin.write(Buffer.from(msg)); // direct write, no conversion
     } else {
       try {
         const data = JSON.parse(msg);
         if (data.type === "register" && data.role === "broadcaster") {
           broadcasterWs = ws;
-          console.log("Broadcaster connected");
+          console.log("✅ Broadcaster connected, ready for live");
         }
       } catch {}
     }
@@ -42,22 +42,28 @@ wss.on("connection", ws => {
   ws.on("close", () => {
     if (ws === broadcasterWs) {
       broadcasterWs = null;
-      console.log("Broadcaster disconnected, stream stopped");
+      console.log("⚠ Broadcaster disconnected, stream stopped");
     }
   });
 });
 
-// Start ffmpeg for live MP3 encoding
+// Optimized ffmpeg for low latency
 const ffmpeg = cp.spawn("ffmpeg", [
-  "-f", "f32le",
-  "-ar", "44100",
-  "-ac", "2",
+  "-f", "s16le",      // 16-bit PCM
+  "-ar", "22050",      // lower sample rate → faster encoding
+  "-ac", "1",          // mono
   "-i", "pipe:0",
   "-f", "mp3",
-  "-b:a", "128k",
+  "-b:a", "64k",       // lower bitrate
+  "-preset", "ultrafast", // minimal CPU buffering
   "pipe:1"
 ]);
 
 ffmpeg.stdout.pipe(mp3Stream);
 
-server.listen(process.env.PORT || 3000, ()=>console.log("✅ Live FM Server running"));
+// Root page
+app.get("/", (req, res) => res.send("🎧 Bihar FM Live Server"));
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`✅ Live FM Server vivek running on port ${PORT}`));
+
