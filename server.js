@@ -1,75 +1,63 @@
 const express = require("express");
 const http = require("http");
-const fs = require("fs");
-const path = require("path");
 const { WebSocketServer } = require("ws");
+const { PassThrough } = require("stream");
+const cp = require("child_process");
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-let broadcasterFilePath = null; // currently streamed file
-let broadcasterWs = null;
+// Live MP3 stream
+const mp3Stream = new PassThrough();
 
-// Root
-app.get("/", (req, res) => res.send("🎧 Bihar FM Live Server"));
-
-// Serve audio file as mp3 URL
+// Serve HTTP /stream
 app.get("/stream", (req, res) => {
-  if(!broadcasterFilePath || !fs.existsSync(broadcasterFilePath)){
-    res.status(404).send("No stream available");
-    return;
-  }
-  const stat = fs.statSync(broadcasterFilePath);
-  const total = stat.size;
-
-  let range = req.headers.range;
-  if (!range) range = "bytes=0-";
-
-  const parts = range.replace(/bytes=/, "").split("-");
-  const start = parseInt(parts[0], 10);
-  const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
-
-  const chunkSize = (end - start) + 1;
-  const stream = fs.createReadStream(broadcasterFilePath, { start, end });
-
-  res.writeHead(206, {
-    "Content-Range": `bytes ${start}-${end}/${total}`,
-    "Accept-Ranges": "bytes",
-    "Content-Length": chunkSize,
-    "Content-Type": "audio/mpeg"
+  res.writeHead(200, {
+    "Content-Type": "audio/mpeg",
+    "Connection": "keep-alive",
+    "Cache-Control": "no-cache"
   });
-  stream.pipe(res);
+  mp3Stream.pipe(res);
 });
 
-// WebSocket for broadcaster panel
+// WebSocket for broadcaster
+let broadcasterWs = null;
 wss.on("connection", ws => {
   ws.on("message", msg => {
-    try{
-      const data = JSON.parse(msg);
-      if(data.type==="register" && data.role==="broadcaster"){
-        broadcasterWs = ws;
-        console.log("Broadcaster connected");
-      }
-
-      // Receive file path from broadcaster
-      if(data.type==="file"){
-        // Server stores file path to serve to listeners
-        broadcasterFilePath = data.payload.path;
-        console.log("Broadcaster streaming file:", broadcasterFilePath);
-      }
-    }catch(e){}
+    if (ws === broadcasterWs) {
+      // raw PCM Float32Array from broadcaster
+      ffmpeg.stdin.write(Buffer.from(msg));
+    } else {
+      try {
+        const data = JSON.parse(msg);
+        if (data.type === "register" && data.role === "broadcaster") {
+          broadcasterWs = ws;
+          console.log("Broadcaster connected");
+        }
+      } catch {}
+    }
   });
 
-  ws.on("close", ()=> {
-    if(ws===broadcasterWs) {
-      broadcasterWs=null;
-      broadcasterFilePath=null;
+  ws.on("close", () => {
+    if (ws === broadcasterWs) {
+      broadcasterWs = null;
       console.log("Broadcaster disconnected, stream stopped");
     }
   });
 });
 
-// Start server
-const PORT = 3000;
-server.listen(PORT, ()=>console.log(`✅ Bihar FM Server running on port ${PORT}`));
+// Start ffmpeg for live MP3 encoding
+const ffmpeg = cp.spawn("ffmpeg", [
+  "-f", "f32le",
+  "-ar", "44100",
+  "-ac", "2",
+  "-i", "pipe:0",
+  "-f", "mp3",
+  "-b:a", "128k",
+  "pipe:1"
+]);
+
+ffmpeg.stdout.pipe(mp3Stream);
+
+server.listen(process.env.PORT || 3000, ()=>console.log("✅ Live FM Server running"));
